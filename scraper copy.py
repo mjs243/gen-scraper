@@ -10,16 +10,16 @@ from datetime import datetime
 import random
 
 # --- configuration ---
-CONCURRENT_DOWNLOADS = 3
+CONCURRENT_DOWNLOADS = 3  # reduced from 5 to be less aggressive
 CHUNK_SIZE = 8192
 TIMEOUT_SECONDS = 300
 MAX_RETRIES = 3
 
 # rate limiting
-MIN_DELAY_BETWEEN_REQUESTS = 1.0
-MAX_DELAY_BETWEEN_REQUESTS = 3.0
-MIN_DELAY_BETWEEN_DOWNLOADS = 2.0
-MAX_DELAY_BETWEEN_DOWNLOADS = 5.0
+MIN_DELAY_BETWEEN_REQUESTS = 1.0  # min seconds between requests
+MAX_DELAY_BETWEEN_REQUESTS = 3.0  # max seconds between requests
+MIN_DELAY_BETWEEN_DOWNLOADS = 2.0  # min seconds between starting downloads
+MAX_DELAY_BETWEEN_DOWNLOADS = 5.0  # max seconds between starting downloads
 
 # user agent rotation - mix of common browsers
 USER_AGENTS = [
@@ -39,14 +39,6 @@ PAGINATION_SELECTORS = {
     '4': {'name': 'WordPress style', 'selector': '.nav-links a, .pagination a'},
     '5': {'name': 'Shopify/e-commerce', 'selector': '.pagination__item a, a[aria-label*="page"]'},
     '6': {'name': 'Bootstrap pagination', 'selector': '.pagination li a, ul.pagination a'},
-}
-
-# video link selectors
-VIDEO_SELECTORS = {
-    '1': {'name': 'Anchor tags with /video href (default)', 'type': 'link', 'selector': 'a[href^="/video"]', 'attr': 'href'},
-    '2': {'name': 'Video tags with src', 'type': 'video', 'selector': 'video[src]', 'attr': 'src'},
-    '3': {'name': 'Video source tags', 'type': 'video', 'selector': 'video source[src]', 'attr': 'src'},
-    '4': {'name': 'Video tags (any)', 'type': 'video', 'selector': 'video', 'attr': 'src'},
 }
 
 
@@ -95,28 +87,32 @@ async def get_best_download_link(session, video_page_url, logger):
     """
     visits a video page and finds the best quality h264 download link.
     """
+    # random delay before request
     await random_delay(MIN_DELAY_BETWEEN_REQUESTS, MAX_DELAY_BETWEEN_REQUESTS)
     
     logger.info(f"finding link on: {video_page_url}")
     try:
         async with session.get(video_page_url, headers=get_random_headers()) as response:
-            # handle rate limiting before raising an error for other statuses
-            if response.status == 429:
-                logger.warning(f"rate limited (429) on {video_page_url}, backing off for 30s...")
-                await asyncio.sleep(30)
+            if response.status == 429:  # too many requests
+                logger.warning(f"rate limited on {video_page_url}, backing off...")
+                await asyncio.sleep(30)  # wait 30 seconds
                 return None, None
             
-            # this will raise an aiohttp.ClientResponseError for 4xx and 5xx statuses
-            response.raise_for_status()
+            if response.status != 200:
+                logger.error(f"failed to fetch {video_page_url} - status: {response.status}")
+                return None, None
 
             soup = BeautifulSoup(await response.text(), "html.parser")
             
             highest_quality = 0
             best_link = None
             
+            # find all h264 download links
             links = soup.select('div.dloaddivcol span.download-h264 a')
+
             for link in links:
                 href = link.get('href')
+                # extract quality from the url, e.g., /dload/.../720/...
                 parts = href.split('/')
                 if len(parts) > 3 and parts[3].isdigit():
                     quality = int(parts[3])
@@ -131,34 +127,29 @@ async def get_best_download_link(session, video_page_url, logger):
 
             logger.warning(f"no h264 download links found on {video_page_url}")
             return None, None
-            
-    # more specific error handling
-    except aiohttp.ClientResponseError as e:
-        logger.error(f"http error fetching {video_page_url}: status {e.status} - {e.message}")
-    except aiohttp.ClientConnectorError as e:
-        logger.error(f"connection error for {video_page_url}: {e}")
-    except asyncio.TimeoutError:
-        logger.error(f"timeout when fetching {video_page_url}")
+
     except Exception as e:
-        logger.error(f"unexpected error processing {video_page_url}: {e}")
-        
-    return None, None
+        logger.error(f"error processing {video_page_url}: {e}")
+        return None, None
 
 
 async def download_file(session, base_url, url, filename, download_dir, semaphore, logger):
     """
     downloads a file with resume capability and retry logic.
     """
+    # stagger download starts
     await random_delay(MIN_DELAY_BETWEEN_DOWNLOADS, MAX_DELAY_BETWEEN_DOWNLOADS)
     
     async with semaphore:
         filepath = download_dir / filename
         temp_filepath = download_dir / f"{filename}.part"
         
+        # check if file is already complete
         if filepath.exists():
             logger.info(f"skipping, already exists: {filename}")
             return True
         
+        # check for partial download
         resume_from = 0
         if temp_filepath.exists():
             resume_from = temp_filepath.stat().st_size
@@ -174,49 +165,71 @@ async def download_file(session, base_url, url, filename, download_dir, semaphor
                 
                 timeout = aiohttp.ClientTimeout(total=TIMEOUT_SECONDS)
                 async with session.get(full_url, headers=headers, timeout=timeout) as response:
+                    # handle rate limiting
                     if response.status == 429:
-                        wait_time = 60 * (attempt + 1)
+                        wait_time = 60 * (attempt + 1)  # increase wait time with each retry
                         logger.warning(f"rate limited on {filename}, waiting {wait_time}s...")
                         await asyncio.sleep(wait_time)
                         continue
                     
+                    # check if server supports resume
                     if resume_from > 0 and response.status not in [206, 200]:
                         logger.warning(f"server doesn't support resume for {filename}, starting over")
                         resume_from = 0
                         temp_filepath.unlink(missing_ok=True)
                         continue
                     
-                    response.raise_for_status()
+                    if response.status not in [200, 206]:
+                        raise Exception(f"http error: {response.status}")
                     
+                    # get total size
                     content_range = response.headers.get('Content-Range')
                     if content_range:
                         total_size = int(content_range.split('/')[-1])
                     else:
                         total_size = int(response.headers.get('content-length', 0)) + resume_from
                     
+                    # setup progress bar
                     mode = 'ab' if resume_from > 0 else 'wb'
                     with tqdm(
-                        total=total_size, initial=resume_from, unit='B', unit_scale=True,
-                        desc=filename, position=0, leave=True
+                        total=total_size,
+                        initial=resume_from,
+                        unit='B',
+                        unit_scale=True,
+                        desc=filename,
+                        position=0,
+                        leave=True
                     ) as pbar:
                         async with aiofiles.open(temp_filepath, mode) as f:
                             async for chunk in response.content.iter_chunked(CHUNK_SIZE):
                                 await f.write(chunk)
                                 pbar.update(len(chunk))
-                                if random.random() < 0.1:
+                                
+                                # small random delays during download to throttle ourselves
+                                if random.random() < 0.1:  # 10% chance per chunk
                                     await asyncio.sleep(random.uniform(0.01, 0.05))
                 
+                # download complete, rename temp file
                 temp_filepath.rename(filepath)
                 logger.info(f"completed: {filename}")
                 return True
                 
-            except (asyncio.TimeoutError, aiohttp.ClientError) as e:
-                logger.warning(f"{type(e).__name__} on {filename}, attempt {attempt + 1}/{MAX_RETRIES}")
+            except asyncio.TimeoutError:
+                logger.warning(f"timeout on {filename}, attempt {attempt + 1}/{MAX_RETRIES}")
                 if temp_filepath.exists():
                     resume_from = temp_filepath.stat().st_size
                 if attempt < MAX_RETRIES - 1:
                     backoff = (2 ** attempt) + random.uniform(0, 1)
                     await asyncio.sleep(backoff)
+                    
+            except aiohttp.ClientError as e:
+                logger.error(f"network error on {filename}: {e}, attempt {attempt + 1}/{MAX_RETRIES}")
+                if temp_filepath.exists():
+                    resume_from = temp_filepath.stat().st_size
+                if attempt < MAX_RETRIES - 1:
+                    backoff = (2 ** attempt) + random.uniform(0, 1)
+                    await asyncio.sleep(backoff)
+                    
             except Exception as e:
                 logger.error(f"unexpected error on {filename}: {e}")
                 break
@@ -225,9 +238,9 @@ async def download_file(session, base_url, url, filename, download_dir, semaphor
         return False
 
 
-async def get_all_video_pages(session, base_url, start_url, pagination_selector, video_selector_config, logger):
+async def get_all_video_pages(session, base_url, start_url, pagination_selector, logger):
     """
-    gets all unique video page urls or direct video urls, including pagination.
+    gets all unique video page urls, including pagination.
     """
     all_video_links = set()
     pages_to_visit = {start_url}
@@ -240,6 +253,7 @@ async def get_all_video_pages(session, base_url, start_url, pagination_selector,
         if current_page in visited_pages:
             continue
         
+        # add delay between page requests
         await random_delay(MIN_DELAY_BETWEEN_REQUESTS, MAX_DELAY_BETWEEN_REQUESTS)
         
         visited_pages.add(current_page)
@@ -248,28 +262,24 @@ async def get_all_video_pages(session, base_url, start_url, pagination_selector,
         try:
             async with session.get(current_page, headers=get_random_headers()) as response:
                 if response.status == 429:
-                    logger.warning(f"rate limited (429) on {current_page}, pausing for 30s...")
+                    logger.warning(f"rate limited, pausing for 30s...")
                     await asyncio.sleep(30)
-                    pages_to_visit.add(current_page)
+                    pages_to_visit.add(current_page)  # re-add to try again
                     continue
                 
-                response.raise_for_status()
-                
+                if response.status != 200:
+                    logger.warning(f"couldn't fetch {current_page}")
+                    continue
+                    
                 soup = BeautifulSoup(await response.text(), 'html.parser')
                 
-                if video_selector_config['type'] == 'link':
-                    video_elements = soup.select(video_selector_config['selector'])
-                    for elem in video_elements:
-                        href = elem.get(video_selector_config['attr'])
-                        if href:
-                            all_video_links.add(urljoin(base_url, href))
-                else:
-                    video_elements = soup.select(video_selector_config['selector'])
-                    for elem in video_elements:
-                        src = elem.get(video_selector_config['attr'])
-                        if src:
-                            all_video_links.add(urljoin(base_url, src))
+                # find all video links
+                video_links = soup.select('a[href^="/video"]')
+                for a in video_links:
+                    full_url = urljoin(base_url, a['href'])
+                    all_video_links.add(full_url)
                 
+                # look for pagination links
                 pagination_links = soup.select(pagination_selector)
                 for link in pagination_links:
                     href = link.get('href')
@@ -277,17 +287,11 @@ async def get_all_video_pages(session, base_url, start_url, pagination_selector,
                         full_pagination_url = urljoin(base_url, href)
                         if full_pagination_url not in visited_pages:
                             pages_to_visit.add(full_pagination_url)
-
-        except aiohttp.ClientResponseError as e:
-            logger.error(f"http error scanning {current_page}: status {e.status} - {e.message}")
-        except aiohttp.ClientConnectorError as e:
-            logger.error(f"connection error for {current_page}: {e}")
-        except asyncio.TimeoutError:
-            logger.error(f"timeout when scanning {current_page}")
+        
         except Exception as e:
-            logger.error(f"unexpected error scanning {current_page}: {e}")
+            logger.error(f"error scanning {current_page}: {e}")
     
-    return all_video_links, video_selector_config['type']
+    return all_video_links
 
 
 def check_vpn_status():
@@ -352,126 +356,67 @@ def select_pagination_selector():
             print("invalid choice. please select 1-6 or 'c' for custom.")
 
 
-def select_video_selector():
-    """
-    prompts user to select how to find videos on the page.
-    """
-    print("\n" + "="*60)
-    print("VIDEO SELECTOR OPTIONS")
-    print("="*60)
-    
-    for key, info in VIDEO_SELECTORS.items():
-        print(f"{key}. {info['name']}")
-    
-    print("c. custom css selector")
-    print("="*60 + "\n")
-    
-    while True:
-        choice = input("select video selector type (press enter for default): ").strip().lower()
-        
-        if choice == '' or choice == '1':
-            print(f"using: {VIDEO_SELECTORS['1']['name']}\n")
-            return VIDEO_SELECTORS['1']
-        elif choice in VIDEO_SELECTORS:
-            print(f"using: {VIDEO_SELECTORS[choice]['name']}\n")
-            return VIDEO_SELECTORS[choice]
-        elif choice == 'c':
-            selector = input("enter custom css selector: ").strip()
-            attr = input("enter attribute to extract (e.g., 'href', 'src'): ").strip()
-            vid_type = input("is this a link to video pages or direct video url? (link/video): ").strip().lower()
-            
-            if selector and attr and vid_type in ['link', 'video']:
-                config = {'name': 'Custom', 'type': vid_type, 'selector': selector, 'attr': attr}
-                print(f"using custom selector: {selector} (extracting {attr})\n")
-                return config
-            else:
-                print("invalid input, using default.\n")
-                return VIDEO_SELECTORS['1']
-        else:
-            print("invalid choice. please select 1-4 or 'c' for custom.")
-
-
-def parse_urls(url_input):
-    """
-    parses url input - handles single url or multiple space-separated urls.
-    """
-    urls = url_input.strip().split()
-    return [url for url in urls if url]
-
-
 async def main():
-    url_input = input("enter url(s) (space-separated for multiple): ").strip()
-    start_urls = parse_urls(url_input)
+    start_url = input("enter the url of the page with video links: ").strip()
     
-    if not start_urls:
-        print("no valid urls provided. exiting.")
-        return
-    
-    parsed = urlparse(start_urls[0])
+    # extract base url from the provided url
+    parsed = urlparse(start_url)
     base_url = f"{parsed.scheme}://{parsed.netloc}"
-    print(f"using base url: {base_url}")
-    print(f"processing {len(start_urls)} url(s)\n")
+    print(f"using base url: {base_url}\n")
     
+    # get download directory
     download_input = input("enter download directory (press enter for './downloads'): ").strip()
     download_dir = Path(download_input) if download_input else Path("downloads")
     download_dir.mkdir(exist_ok=True)
     print(f"downloading to: {download_dir.absolute()}\n")
     
+    # setup logging
     logger = setup_logging(download_dir)
     logger.info("="*60)
     logger.info("starting new download session")
-    logger.info(f"processing {len(start_urls)} starting url(s)")
     logger.info("="*60)
     
-    video_selector_config = select_video_selector()
+    # select pagination selector
     pagination_selector = select_pagination_selector()
     
+    # create a semaphore to limit concurrent downloads
     semaphore = asyncio.Semaphore(CONCURRENT_DOWNLOADS)
     
+    # configure session with timeout and connection limits
     connector = aiohttp.TCPConnector(limit=10, limit_per_host=3)
     timeout = aiohttp.ClientTimeout(total=TIMEOUT_SECONDS)
     
     async with aiohttp.ClientSession(
-        timeout=timeout, connector=connector, headers=get_random_headers()
+        timeout=timeout, 
+        connector=connector,
+        headers=get_random_headers()
     ) as session:
-        logger.info("step 1: finding all video urls...")
-        all_video_links = set()
-        link_type = None
+        # 1. get all unique video page urls
+        logger.info("step 1: finding all video page urls...")
+        video_page_links = await get_all_video_pages(
+            session, base_url, start_url, pagination_selector, logger
+        )
         
-        for start_url in start_urls:
-            logger.info(f"processing: {start_url}")
-            video_links, current_link_type = await get_all_video_pages(
-                session, base_url, start_url, pagination_selector, video_selector_config, logger
-            )
-            all_video_links.update(video_links)
-            if link_type is None:
-                link_type = current_link_type
-        
-        if not all_video_links:
-            logger.error(f"no videos found. exiting.")
+        if not video_page_links:
+            logger.error("no links starting with '/video' found. exiting.")
             return
 
-        logger.info(f"found {len(all_video_links)} unique videos across all urls.")
+        logger.info(f"found {len(video_page_links)} unique video pages.")
         
-        if link_type == 'video':
-            valid_downloads = []
-            for url in all_video_links:
-                parsed_url = urlparse(url)
-                filename = Path(parsed_url.path).name
-                if not filename:
-                    filename = f"video_{hash(url)}.mp4"
-                valid_downloads.append((url, filename))
-        else:
-            logger.info("step 2: getting download links from each page...")
-            download_tasks_info = await asyncio.gather(
-                *[get_best_download_link(session, page, logger) for page in all_video_links]
-            )
-            valid_downloads = [info for info in download_tasks_info if info[0]]
+        # 2. visit each page to get the best download link
+        logger.info("step 2: getting download links from each page...")
+        download_tasks_info = await asyncio.gather(
+            *[get_best_download_link(session, page, logger) for page in video_page_links]
+        )
+        
+        # filter out any pages where a link wasn't found
+        valid_downloads = [info for info in download_tasks_info if info[0]]
         
         if not valid_downloads:
             logger.error("no valid download links found. exiting.")
             return
         
+        # 3. vpn check before starting downloads
         if not check_vpn_status():
             return
         
@@ -482,12 +427,15 @@ async def main():
         logger.info(f"request delays: {MIN_DELAY_BETWEEN_REQUESTS}-{MAX_DELAY_BETWEEN_REQUESTS}s")
         logger.info(f"download delays: {MIN_DELAY_BETWEEN_DOWNLOADS}-{MAX_DELAY_BETWEEN_DOWNLOADS}s")
         
+        # 4. download all files with resume capability
         download_coroutines = [
             download_file(session, base_url, url, filename, download_dir, semaphore, logger)
             for url, filename in valid_downloads
         ]
+        
         results = await asyncio.gather(*download_coroutines)
         
+        # summary
         successful = sum(results)
         failed = len(results) - successful
         logger.info("="*60)
@@ -502,10 +450,4 @@ async def main():
 
 
 if __name__ == "__main__":
-    try:
-        import brotli
-    except ImportError:
-        print("warning: 'brotli' is not installed. some websites may fail to load.")
-        print("run 'pip install brotli' for better compatibility.")
-    
     asyncio.run(main())
